@@ -1,0 +1,6 @@
+pyspark
+tensorflow
+numpy
+pandas
+Pillow
+matplotlib
