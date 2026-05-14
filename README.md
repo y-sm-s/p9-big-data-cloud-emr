@@ -18,52 +18,76 @@ Les images ne sont pas incluses dans ce dépôt. Le pipeline s'attend à trouver
 
 ---
 
-## Architecture cloud
+## Approche en deux phases
+
+### Phase 1 — Reproduction locale de l'architecture AWS avec Docker
+
+Avant tout déploiement sur AWS, j'ai reproduit l'architecture cible entièrement en local à l'aide de **Docker**, pour simuler un cluster Spark multi-nœuds sur ma machine.
+
+Cette décision était délibérément économique : exécuter toutes les itérations de développement et de debugging directement sur EMR aurait engendré des coûts significatifs (facturation au temps de cluster, transferts S3, erreurs de configuration coûteuses à corriger en live).
+
+La phase locale a permis de :
+- **Tester et stresser l'architecture** Spark sans frais cloud — volumes de données, partitionnement, gestion mémoire des workers
+- **Résoudre tous les problèmes de configuration** liés à la mise en place d'un environnement Big Data : dépendances entre PySpark et TensorFlow, sérialisation du modèle MobileNetV2, broadcast des poids du réseau sur les workers, compatibilité des versions Spark/Java
+- **Valider le pipeline de bout en bout** (lecture images → feature extraction → PCA → export Parquet) avant de toucher à l'infrastructure cloud
+- **Réduire drastiquement les coûts AWS** : le cluster EMR n'a été démarré qu'une fois le pipeline stabilisé localement, limitant le temps de facturation au strict nécessaire
+
+### Phase 2 — Déploiement sur Amazon EMR
+
+Une fois le pipeline validé localement, le déploiement sur EMR s'est fait sans surprise grâce au travail effectué en phase 1. Les seuls ajustements ont porté sur les chemins (local → S3) et la configuration du cluster.
+
+---
+
+## Architecture
 
 ```
-Images JPG
-    ↓
-Amazon S3 (stockage)
-    ↓
-Amazon EMR (cluster Spark)
-    ├── Lecture des images (binaryFile)
-    ├── Feature extraction : MobileNetV2 (TensorFlow, broadcasted)
-    ├── Normalisation : StandardScaler (Spark MLlib)
-    └── Réduction dimensionnelle : PCA 200 composantes (Spark MLlib)
-    ↓
-Export résultats → S3 (format Parquet)
-Export pipeline ajusté → S3 (Spark Pipeline)
+Phase 1 — Local (Docker)              Phase 2 — AWS Cloud
+─────────────────────────             ─────────────────────────
+Docker Spark cluster                  Amazon S3
+  ├── Master node                       └── Images JPG
+  └── Worker nodes                            ↓
+        ↓                             Amazon EMR (Spark)
+  Images locales                        ├── Lecture binaryFile (S3)
+        ↓                               ├── Feature extraction MobileNetV2
+  Pipeline identique                    │   (broadcasted sur workers)
+  (test & troubleshooting)              ├── StandardScaler
+                                        └── PCA 200 composantes
+                                              ↓
+                                      Export S3 (Parquet + Pipeline)
 ```
 
 ---
 
 ## Méthodologie
 
-1. **Initialisation** : création d'une SparkSession sur cluster EMR, connexion au bucket S3
-2. **Chargement des images** : lecture des fichiers `.jpg` avec Spark `binaryFile`, extraction du label depuis le chemin
-3. **Feature extraction distribuée** : MobileNetV2 (pré-entraîné ImageNet, sans la tête de classification) broadcasté sur tous les workers Spark — extraction de vecteurs de features de 1280 dimensions par image
-4. **Pipeline Spark MLlib** :
+1. **Containerisation locale** : mise en place d'un cluster Spark via Docker Compose, reproduction des contraintes d'un environnement distribué (réseau entre nœuds, gestion des ressources, sérialisation)
+2. **Troubleshooting Big Data** : résolution des incompatibilités PySpark/TensorFlow, optimisation de la stratégie de broadcast du modèle, gestion de la mémoire des workers
+3. **Chargement des images** : lecture des fichiers `.jpg` avec Spark `binaryFile`, extraction du label depuis le chemin de fichier
+4. **Feature extraction distribuée** : MobileNetV2 (pré-entraîné ImageNet, couche avant classification) broadcasté sur tous les workers — vecteurs de 1280 dimensions par image
+5. **Pipeline Spark MLlib** :
    - `StandardScaler` : normalisation des features (withMean=True, withStd=True)
-   - `PCA(k=200)` : réduction à 200 composantes
-5. **Export** : features réduites en Parquet sur S3, pipeline ajusté sauvegardé pour réutilisation
+   - `PCA(k=200)` : réduction dimensionnelle
+6. **Export** : features réduites en Parquet sur S3, pipeline ajusté sauvegardé pour réutilisation sur de nouvelles images
 
 ---
 
 ## Résultats
 
-- 200 composantes PCA retenues, expliquant ~95% de la variance des features MobileNetV2
-- Pipeline Spark complet exporté et réutilisable sur de nouvelles images sans réentraînement
+- 200 composantes PCA retenues, expliquant **~95% de la variance** des features MobileNetV2
+- Pipeline Spark complet exporté et réutilisable sans réentraînement
 - Traitement entièrement distribué : scalable à des millions d'images sans modification du code
+- **Coûts AWS maîtrisés** grâce à la phase de validation locale : zéro surprise au déploiement
 
 ---
 
 ## Stack technique
 
 - Python 3
-- PySpark (Spark MLlib : StandardScaler, PCA, Pipeline, binaryFile)
-- TensorFlow / Keras (MobileNetV2)
-- AWS EMR (cluster Spark managé)
-- AWS S3 (stockage objets)
+- **Docker** (reproduction locale du cluster Spark)
+- **PySpark** (Spark MLlib : StandardScaler, PCA, Pipeline, binaryFile)
+- **TensorFlow / Keras** (MobileNetV2)
+- **AWS EMR** (cluster Spark managé)
+- **AWS S3** (stockage objets)
 - pandas, numpy, Pillow, matplotlib
 
 ---
@@ -84,14 +108,14 @@ p9-big-data-cloud-emr/
 
 ## Lancer le notebook
 
-Ce notebook est conçu pour s'exécuter sur un cluster **Amazon EMR** avec PySpark.
-
-Pour le tester localement (sur un sous-ensemble d'images) :
+**En local (Docker)** — reproduire l'architecture avant tout déploiement cloud :
 
 ```bash
-pip install -r requirements.txt
 # Adapter les chemins PATH vers un dossier local au lieu de S3
+pip install -r requirements.txt
 jupyter notebook notebooks/01_pipeline_emr_spark.ipynb
 ```
 
-Pour un déploiement cloud complet, créez un cluster EMR avec Spark et TensorFlow, uploadez le notebook sur S3, et exécutez-le via EMR Notebooks ou JupyterHub.
+**Sur AWS EMR** — une fois le pipeline validé localement :
+
+Créez un cluster EMR avec Spark et TensorFlow, uploadez le notebook sur S3, et exécutez-le via EMR Notebooks ou JupyterHub. Les chemins S3 sont déjà configurés dans le notebook.
